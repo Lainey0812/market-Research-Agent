@@ -2,19 +2,24 @@ import streamlit as st
 from openai import OpenAI
 import requests
 import json
+import re
+from duckduckgo_search import DDGS
 
 # from fpdf import FPDF
 from langchain_openai import ChatOpenAI
+import os
 
 # 导入 LangChain 消息对象
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.utilities import GoogleSerperAPIWrapper
 
-
+os.environ["SERPER_API_KEY"] = "9fd7b3cb044ed5a235e8a14a3c72e3e8b7dd2cbc"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
+os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
 # ========== 基础配置 ==========
 st.set_page_config(page_title="AI 市场调研助理", layout="wide")
 st.title("🧠 AI 市场调研助理 ")
 st.markdown("让 AI 帮你快速完成行业趋势、竞争格局、消费者洞察等市场调研任务。")
-
 base_url = "https://yinli.one/v1"
 # api_key = ("sk-LigUlIOoxblNRsIW83Ivom303rVkgteWazFVDe4JldylDkPU",)
 # ========== 输入区 ==========
@@ -54,6 +59,38 @@ def save_as_pdf(text, filename="market_report.pdf"):
     return filename
 
 
+def clean_and_load_json(text_output: str):
+    """尝试从 LLM 的输出中提取并加载 JSON"""
+    text_output = re.sub(r"[\u200b-\u200f\uFEFF\xa0]", "", text_output)
+    # Step 1: 尝试匹配```json ... ```代码块中的内容
+    match = re.search(
+        r"```(?:json)?\s*(\{[\s\S]*?\})\s*```",
+        text_output,
+        re.DOTALL | re.IGNORECASE,  # DOTALL 让 . 匹配换行符
+    )
+
+    if not match:
+        match = re.search(r"(\{[\s\S]*?\})", text_output.strip())
+        if not match:
+            raise ValueError("未能找到有效的 JSON 代码块或裸 JSON 结构。")
+
+    # 提取代码块中的纯 JSON 字符串
+    json_string = match.group(1).strip()
+
+    # 步骤 2: 进行 JSON 解析
+    # 注意：我们假设提取出的 json_string 是干净的
+    return json.loads(json_string)
+
+
+def search_ddg(query, max_results=5):
+    try:
+        results = DDGS().text(query, max_results=max_results)
+        texts = [r["body"] for r in results]
+        return "\n".join(texts)
+    except Exception as e:
+        return f"DDG 搜索失败：{e}"
+
+
 # ========== 主流程 ==========
 if generate_btn:
     if not api_key or not query:
@@ -90,7 +127,7 @@ if generate_btn:
         
         ## 输出格式
         以 json 格式输出结果，格式如下：
-        {
+        ```json{
           "intent": "问题类型",  
           "entities": {
             "industry": "行业名称",
@@ -103,15 +140,12 @@ if generate_btn:
             "搜索查询 3",
             "搜索查询 4"
           ]
-        }
+        }```
         
         ## 限制
         - 仅处理和回答与市场分析紧密相关的用户问题，坚决拒绝回答无关话题。
         - 输出内容必须严格遵循给定的 json 格式进行组织，不得出现任何格式偏差。
-        - 所提供的信息和分析必须基于客观事实，切实保证内容准确、合理、可靠。 
-        
-        ## 信息来源
-        - 所依据的数据和信息来自权威的市场研究报告、行业资讯平台等可靠渠道。请在回答中明确标注引用来源。
+        - 请确保输出的格式是json
         """
 
         # 定义 LangChain 消息列表
@@ -125,7 +159,7 @@ if generate_btn:
         intent_text = intent_resp.content.strip()
 
         try:
-            intent_json = json.loads(intent_text)
+            intent_json = clean_and_load_json(intent_text)
             if len(intent_json.get("expanded_queries", [])) < 2:
                 raise ValueError("expanded_queries 数量不足")
             # 从 expanded_queries 中获取第一个查询用于 Step 2 的搜索
@@ -141,92 +175,118 @@ if generate_btn:
 
             st.session_state.intent_json = intent_json
             st.session_state.confirmed = False  # 初始化确认状态
+        if "final_queries" not in st.session_state:
+            st.session_state.final_queries = intent_json["expanded_queries"]
+            st.divider()
 
-            # 展示扩展结果并等待用户确认
-            if "intent_json" in st.session_state and not st.session_state.confirmed:
-                st.subheader("📘 调研方向识别结果（请确认或修改）")
-                edited_intent_json = st.json(st.session_state.intent_json)
-                for i, q in enumerate(
-                    st.session_state.intent_json["expanded_queries"], 1
-                ):
-                    st.write(f"{i}. {q}")
+            # Step 2️⃣ 用户确认/修改搜索关键词
+            st.subheader("🔍 搜索关键词确认与修改")
+            st.markdown(
+                "模型已为您生成以下搜索关键词。您可以直接**确认**进行搜索，或在文本框中**修改**后点击**重新生成**。"
+            )
+            # 1. 展示和编辑区域
+            # 将列表转换成带编号的字符串，方便用户编辑
+            queries_text = "\n".join(st.session_state.final_queries)
+            # 使用 text_area 允许用户编辑，并存储在 session state 的临时变量中
+            edited_queries_text = st.text_area(
+                "📝 请确认或修改关键词",
+                value=queries_text,
+                height=200,
+                key="edited_queries_text",  # 确保 Streamlit 能够跟踪状态
+            )
 
-                # 用户确认按钮
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("✅ 确认调研方向,并开始搜索"):
-                        st.session_state.confirmed = True
-                        st.success("已确认，即将开始检索")
-                with col2:
-                    if st.button("✏️ 修改调研方向"):
-                        del st.session_state.intent_json
-                        st.session_state.confirmed = False
+            # 用户确认按钮
+            col1, col2 = st.columns(2)
+            with col1:
+                confirm_btn = st.button(
+                    "🚀 确认无误，开始搜索", use_container_width=True
+                )
+                if confirm_btn:
+                    st.session_state.confirmed = True
+
+            with col2:
+                if st.button("✏️ 修改调研方向"):
+                    del st.session_state.intent_json
+                    st.session_state.confirmed = False
 
             search_query_for_ddg = query
 
         st.subheader("📘 调研方向识别结果")
         st.json(intent_json)
 
-    # Step 2️⃣ 检索市场信息
+    # # Step 2️⃣ 检索市场信息
     with st.spinner("🔎 正在检索市场数据..."):
-        merged_info = search_market_info(search_query_for_ddg)
-        if "检索出错" in merged_info:
-            st.warning(merged_info)
-            st.stop()
-        st.success("数据检索完成。")
+        search_wrapper = GoogleSerperAPIWrapper()
+        # 调用 results() 方法获取原始结构化数据
+        raw_data = search_wrapper.results(query, num=5)  # 明确指定 num=5
+        # 提取前 N 条结果（例如前 3 条）
+        num_results_needed = 3
+        if "organic" in raw_data:
+            # Serper 的主要搜索结果在 'organic' 键中
+            top_results = raw_data["organic"][:num_results_needed]
 
-    # Step 3️⃣ 生成报告
-    # with st.spinner("🧾 正在生成市场报告..."):
+            print(f"✅ 成功获取 {len(top_results)} 条结构化搜索结果：{top_results}")
+    for i, result in enumerate(top_results):
+        print(f"--- 结果 {i+1} ---")
+        print(f"标题: {result.get('title')}")
+        print(f"摘要: {result.get('snippet')[:100]}...")  # 打印摘要前100字符
+        print(f"链接: {result.get('link')}")
+    else:
+        print("❌ 搜索失败或结果为空。")
+#     st.success("数据检索完成。")
 
-    #     report_prompt = f"""
-    #     你是一位专业的市场分析顾问，请根据以下资料，为主题“{query}”生成一份结构化市场调研报告，格式如下：
-    #     ---
-    #     ## 行业概述
-    #     ...
-    #     ## 主要趋势
-    #     ...
-    #     ## 竞争格局
-    #     ...
-    #     ## 用户洞察
-    #     ...
-    #     ## 总结与建议
-    #     ...
-    #     ---
-    #     以下是参考资料：
-    #     {merged_info}
-    #     """
+# Step 3️⃣ 生成报告
+# with st.spinner("🧾 正在生成市场报告..."):
 
-    #     # 定义生成报告的消息列表
-    #     report_messages = [
-    #         SystemMessage(
-    #             content="你是一位专业的市场分析顾问，专注于生成结构严谨、内容深入的市场调研报告。"
-    #         ),
-    #         HumanMessage(content=report_prompt),
-    #     ]
+#     report_prompt = f"""
+#     你是一位专业的市场分析顾问，请根据以下资料，为主题“{query}”生成一份结构化市场调研报告，格式如下：
+#     ---
+#     ## 行业概述
+#     ...
+#     ## 主要趋势
+#     ...
+#     ## 竞争格局
+#     ...
+#     ## 用户洞察
+#     ...
+#     ## 总结与建议
+#     ...
+#     ---
+#     以下是参考资料：
+#     {merged_info}
+#     """
 
-    #     # 调整温度以获得更具创造性的报告
-    #     llm.temperature = 0.5
-    #     report_resp = llm.invoke(report_messages)
-    #     report_text = report_resp.content.strip()
+#     # 定义生成报告的消息列表
+#     report_messages = [
+#         SystemMessage(
+#             content="你是一位专业的市场分析顾问，专注于生成结构严谨、内容深入的市场调研报告。"
+#         ),
+#         HumanMessage(content=report_prompt),
+#     ]
 
-    #     st.success("✅ 报告生成完成")
-    #     st.subheader("📄 市场调研报告")
-    #     st.markdown(report_text)
+#     # 调整温度以获得更具创造性的报告
+#     llm.temperature = 0.5
+#     report_resp = llm.invoke(report_messages)
+#     report_text = report_resp.content.strip()
 
-    #     # Step 4️⃣ 导出功能
-    #     st.download_button(
-    #         label="💾 下载报告（Markdown）",
-    #         data=report_text,
-    #         file_name="market_report.md",
-    #         mime="text/markdown",
-    #     )
+#     st.success("✅ 报告生成完成")
+#     st.subheader("📄 市场调研报告")
+#     st.markdown(report_text)
 
-    #     # 导出 PDF
-    #     pdf_path = save_as_pdf(report_text)
-    #     with open(pdf_path, "rb") as f:
-    #         st.download_button(
-    #             label="📄 下载报告（PDF）",
-    #             data=f,
-    #             file_name="market_report.pdf",
-    #             mime="application/pdf",
-    #         )
+#     # Step 4️⃣ 导出功能
+#     st.download_button(
+#         label="💾 下载报告（Markdown）",
+#         data=report_text,
+#         file_name="market_report.md",
+#         mime="text/markdown",
+#     )
+
+#     # 导出 PDF
+#     pdf_path = save_as_pdf(report_text)
+#     with open(pdf_path, "rb") as f:
+#         st.download_button(
+#             label="📄 下载报告（PDF）",
+#             data=f,
+#             file_name="market_report.pdf",
+#             mime="application/pdf",
+#         )
