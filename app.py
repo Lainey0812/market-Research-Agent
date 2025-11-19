@@ -1,292 +1,246 @@
+from agents.utils import clean_and_load_json, merge_and_dedupe_texts, llm_client
+from agents.searcher import (
+    extract_texts_from_pdf,
+    serper_search,
+    fetch_full_content,
+)
+from agents.report_maker import (
+    generate_market_report_from_corpus,
+    propose_followup_questions,
+    generate_competitor_matrix,
+)
 import streamlit as st
+import asyncio
+from agents.writer import expand_query_with_prompt
+from typing import List, Dict, Any
 from openai import OpenAI
-import requests
-import json
-import re
-from duckduckgo_search import DDGS
 
-# from fpdf import FPDF
-from langchain_openai import ChatOpenAI
-import os
-
-# 导入 LangChain 消息对象
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_community.utilities import GoogleSerperAPIWrapper
-
-os.environ["SERPER_API_KEY"] = "9fd7b3cb044ed5a235e8a14a3c72e3e8b7dd2cbc"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:7890"
-# ========== 基础配置 ==========
-st.set_page_config(page_title="AI 市场调研助理", layout="wide")
-st.title("🧠 AI 市场调研助理 ")
-st.markdown("让 AI 帮你快速完成行业趋势、竞争格局、消费者洞察等市场调研任务。")
-base_url = "https://yinli.one/v1"
-# api_key = ("sk-LigUlIOoxblNRsIW83Ivom303rVkgteWazFVDe4JldylDkPU",)
-# ========== 输入区 ==========
-# 【重要修改 2：提示用户输入 API Key】
-api_key = st.text_input("请输入你的 API Key：", type="password")
-query = st.text_input("请输入调研主题（例如：新能源车市场趋势）")
-generate_btn = st.button("🚀 开始生成报告")
+# ---------------------------
+# 页面基础设置
+# ---------------------------
+st.set_page_config(page_title="Market Intelligence Agent", layout="wide")
+st.title("📊 市场分析 Agent")
+# ---------------------------
+# session state 初始化
+# ---------------------------
+if "expanded_queries" not in st.session_state:
+    st.session_state.expanded_queries = []
+if "final_queries" not in st.session_state:
+    st.session_state.final_queries = []
+if "collected_texts" not in st.session_state:
+    st.session_state.collected_texts = ""  # 合并的语料
+if "report" not in st.session_state:
+    st.session_state.report = ""
+if "history" not in st.session_state:
+    st.session_state.history = []  # 用于多轮的问答记录
 
 
-# ========== 功能函数 (保持不变) ==========
-def search_market_info(query: str):
-    """使用 DuckDuckGo 免费接口进行信息检索"""
-    st.info("🔍 正在搜索市场数据...")
-    try:
-        # 注意：ddg-api.herokuapp.com 接口可能不稳定，但此处沿用原代码
-        res = requests.get(
-            f"https://ddg-api.herokuapp.com/search?q={query}&max_results=8"
-        )
-        data = res.json()
-        if isinstance(data, list):
-            merged_text = "\n\n".join([f"• {r['title']}\n{r['snippet']}" for r in data])
-            return merged_text
-        return "未找到相关结果。"
-    except Exception as e:
-        st.error(f"检索出错：{e}")
-        return "检索出错，无法获取外部数据。"
+# ---------------------------
+# UI：输入 & 扩写 & 编辑
+# ---------------------------
+st.sidebar.header("1) 输入 & 扩写")
+user_query = st.sidebar.text_input(
+    "调研主题 / 问题（示例：电动汽车市场趋势）", value=""
+)
+col1, col2 = st.sidebar.columns([1, 1])
+with col1:
+    if st.sidebar.button("生成扩写 Query"):
+        if not user_query.strip():
+            st.sidebar.warning("请输入调研主题")
+        else:
+            parsed = expand_query_with_prompt(user_query)
+            eqs = parsed.get("expanded_queries") or []
+            # 保底
+            if not eqs:
+                eqs = [
+                    f"{user_query} 市场规模 2025 中国",
+                    f"{user_query} 竞争格局 主要厂商",
+                    f"{user_query} 用户画像 需求痛点",
+                    f"{user_query} 投融资 政策 机会 风险",
+                ]
+            st.session_state.expanded_queries = eqs
+            st.session_state.final_queries = list(eqs)
+            st.sidebar.success("扩写完成，请在下方编辑或确认")
 
+with col2:
+    if st.sidebar.button("重新生成（清空已编辑）"):
+        st.session_state.expanded_queries = []
+        st.session_state.final_queries = []
+        st.sidebar.info("已清空，重新输入后再生成")
 
-def save_as_pdf(text, filename="market_report.pdf"):
-    """将报告内容导出为 PDF"""
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    for line in text.split("\n"):
-        pdf.multi_cell(0, 8, line)
-    pdf.output(filename)
-    return filename
+# 显示并允许用户修改 final queries
+st.sidebar.markdown("### 编辑 / 确认搜索 Query（可修改）")
+if st.session_state.expanded_queries:
+    tmp = []
+    for i, q in enumerate(st.session_state.expanded_queries):
+        new_q = st.sidebar.text_input(f"Query {i+1}", value=q, key=f"editable_q_{i}")
+        tmp.append(new_q)
+    # 用户可以确认修改后的 queries
+    if st.sidebar.button("确认使用这些 Query 开始搜索"):
+        st.session_state.final_queries = tmp
+        st.sidebar.success("已确认，准备开始搜集数据")
+else:
+    st.sidebar.info("先点击 “生成扩写 Query” 以自动生成候选")
 
+# ---------------------------
+# UI：PDF 上传 & 粘贴文本（背景资料）
+# ---------------------------
+st.sidebar.header("2) 背景资料（可选）")
+uploaded = st.sidebar.file_uploader(
+    "上传行业报告（PDF），可上传多份", type=["pdf"], accept_multiple_files=True
+)
+pasted_text = st.sidebar.text_area(
+    "或粘贴内部资料（如：行业片段/公司资料/数据表）", height=150
+)
 
-def clean_and_load_json(text_output: str):
-    """尝试从 LLM 的输出中提取并加载 JSON"""
-    text_output = re.sub(r"[\u200b-\u200f\uFEFF\xa0]", "", text_output)
-    # Step 1: 尝试匹配```json ... ```代码块中的内容
-    match = re.search(
-        r"```(?:json)?\s*(\{[\s\S]*?\})\s*```",
-        text_output,
-        re.DOTALL | re.IGNORECASE,  # DOTALL 让 . 匹配换行符
-    )
+if uploaded:
+    pdf_texts = []
+    for f in uploaded:
+        pdf_texts.append(extract_texts_from_pdf(f))
+    joined_pdf_text = "\n\n".join(pdf_texts)
+    if joined_pdf_text.strip():
+        # 合并到全局语料
+        st.session_state.collected_texts += "\n\n[PDF BACKGROUND]\n" + joined_pdf_text
+        st.sidebar.success(f"已解析 {len(uploaded)} 个 PDF，并加入背景语料")
 
-    if not match:
-        match = re.search(r"(\{[\s\S]*?\})", text_output.strip())
-        if not match:
-            raise ValueError("未能找到有效的 JSON 代码块或裸 JSON 结构。")
+if pasted_text and st.sidebar.button("将粘贴内容加入语料"):
+    st.session_state.collected_texts += "\n\n[PASTE BACKGROUND]\n" + pasted_text
+    st.sidebar.success("粘贴内容已加入背景语料")
 
-    # 提取代码块中的纯 JSON 字符串
-    json_string = match.group(1).strip()
-
-    # 步骤 2: 进行 JSON 解析
-    # 注意：我们假设提取出的 json_string 是干净的
-    return json.loads(json_string)
-
-
-def search_ddg(query, max_results=5):
-    try:
-        results = DDGS().text(query, max_results=max_results)
-        texts = [r["body"] for r in results]
-        return "\n".join(texts)
-    except Exception as e:
-        return f"DDG 搜索失败：{e}"
-
-
-# ========== 主流程 ==========
-if generate_btn:
-    if not api_key or not query:
-        st.warning("⚠️ 请输入 API Key 和 调研主题")
-        st.stop()
-
-        # 创建 LangChain Chat 模型实例（基线温度为 0，可在生成报告时调整）
-    llm = ChatOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-        temperature=0.2,  # 随机性：0（确定性）~1（创造性）
-        model="gpt-4o-mini",
-    )
-
-    # Step 1️⃣ 调研方向识别
-    with st.spinner("🧠 正在识别调研方向..."):
-        # 完整的 System Prompt
-        system_prompt_content = """
-        # 角色
-        你是一位专业且经验深厚的市场分析专家，凭借扎实的专业知识和丰富的实战经验，为用户深入剖析各类市场问题。
-        
-        ## 技能
-        ### 技能 1: 判断问题类型
-        仔细研读用户输入，精确判断问题所属类型，为用户匹配最合适的方向类别，类型涵盖行业趋势、竞品分析、用户画像、投资分析商业模式等各类市场分析相关领域。
-        
-        ### 2: 数据信息关联
-        依据判断出的问题类型，关联与之匹配的各类市场数据信息，为后续分析提供有力支撑。
-        
-        ### 技能 3: 提取关键词
-        从用户输入中精准提炼关键信息，关键词包含但不限于行业、地区、时间、品牌、产品等。若用户未提供时间信息，默认时间为最近一年，即 2025 年；若未提及地区，默认地区为中国。
-        
-        ### 技能 4: 扩写搜索查询
-        围绕提取的关键词，精心扩写出 4 个语义相近但描述更为详尽的搜索查询。这些查询需充分融合用户原始问题以及关键词的相关信息，确保查询更具针对性与全面性。
-        
-        ## 输出格式
-        以 json 格式输出结果，格式如下：
-        ```json{
-          "intent": "问题类型",  
-          "entities": {
-            "industry": "行业名称",
-            "region": "地区名称",
-            "time_range": "时间范围"
-          },
-          "expanded_queries": [
-            "搜索查询 1",
-            "搜索查询 2",
-            "搜索查询 3",
-            "搜索查询 4"
-          ]
-        }```
-        
-        ## 限制
-        - 仅处理和回答与市场分析紧密相关的用户问题，坚决拒绝回答无关话题。
-        - 输出内容必须严格遵循给定的 json 格式进行组织，不得出现任何格式偏差。
-        - 请确保输出的格式是json
-        """
-
-        # 定义 LangChain 消息列表
-        intent_messages = [
-            SystemMessage(content=system_prompt_content),
-            HumanMessage(content=f"请分析这个主题：{query}"),
-        ]
-
-        # 使用 LangChain 的 .invoke() 方法进行调用
-        intent_resp = llm.invoke(intent_messages)
-        intent_text = intent_resp.content.strip()
-
-        try:
-            intent_json = clean_and_load_json(intent_text)
-            if len(intent_json.get("expanded_queries", [])) < 2:
-                raise ValueError("expanded_queries 数量不足")
-            # 从 expanded_queries 中获取第一个查询用于 Step 2 的搜索
-            # search_query_for_ddg = intent_json["expanded_queries"][0]
-        except Exception as e:
-            st.error(f"⚠️ JSON解析失败，模型未返回正确的结构化数据。错误：{e}")
-            # 失败时使用默认值
-            intent_json = {
-                "intent": "行业趋势",
-                "entities": {"industry": query, "region": "中国", "time_range": "2025"},
-                "expanded_queries": [f"{query}市场规模分析", f"{query}最新发展情况"],
-            }
-
-            st.session_state.intent_json = intent_json
-            st.session_state.confirmed = False  # 初始化确认状态
-        if "final_queries" not in st.session_state:
-            st.session_state.final_queries = intent_json["expanded_queries"]
-            st.divider()
-
-            # Step 2️⃣ 用户确认/修改搜索关键词
-            st.subheader("🔍 搜索关键词确认与修改")
-            st.markdown(
-                "模型已为您生成以下搜索关键词。您可以直接**确认**进行搜索，或在文本框中**修改**后点击**重新生成**。"
-            )
-            # 1. 展示和编辑区域
-            # 将列表转换成带编号的字符串，方便用户编辑
-            queries_text = "\n".join(st.session_state.final_queries)
-            # 使用 text_area 允许用户编辑，并存储在 session state 的临时变量中
-            edited_queries_text = st.text_area(
-                "📝 请确认或修改关键词",
-                value=queries_text,
-                height=200,
-                key="edited_queries_text",  # 确保 Streamlit 能够跟踪状态
-            )
-
-            # 用户确认按钮
-            col1, col2 = st.columns(2)
-            with col1:
-                confirm_btn = st.button(
-                    "🚀 确认无误，开始搜索", use_container_width=True
-                )
-                if confirm_btn:
-                    st.session_state.confirmed = True
-
-            with col2:
-                if st.button("✏️ 修改调研方向"):
-                    del st.session_state.intent_json
-                    st.session_state.confirmed = False
-
-            search_query_for_ddg = query
-
-        st.subheader("📘 调研方向识别结果")
-        st.json(intent_json)
-
-    # # Step 2️⃣ 检索市场信息
-    with st.spinner("🔎 正在检索市场数据..."):
-        search_wrapper = GoogleSerperAPIWrapper()
-        # 调用 results() 方法获取原始结构化数据
-        raw_data = search_wrapper.results(query, num=5)  # 明确指定 num=5
-        # 提取前 N 条结果（例如前 3 条）
-        num_results_needed = 3
-        if "organic" in raw_data:
-            # Serper 的主要搜索结果在 'organic' 键中
-            top_results = raw_data["organic"][:num_results_needed]
-
-            print(f"✅ 成功获取 {len(top_results)} 条结构化搜索结果：{top_results}")
-    for i, result in enumerate(top_results):
-        print(f"--- 结果 {i+1} ---")
-        print(f"标题: {result.get('title')}")
-        print(f"摘要: {result.get('snippet')[:100]}...")  # 打印摘要前100字符
-        print(f"链接: {result.get('link')}")
+# ---------------------------
+# 开始并行搜索并抓取全文（主按钮）
+# ---------------------------
+st.header("3) 搜索并抓取网页全文")
+if st.button("开始搜索并抓取（使用已确认的 Query）"):
+    if not st.session_state.final_queries:
+        st.warning("请先生成并确认搜索 Query（侧边栏）")
     else:
-        print("❌ 搜索失败或结果为空。")
-#     st.success("数据检索完成。")
+        queries = st.session_state.final_queries
 
-# Step 3️⃣ 生成报告
-# with st.spinner("🧾 正在生成市场报告..."):
+        async def run_all_search_and_fetch(queries_list):
+            per_query_results = {}  # {query: [ {title, link, snippet, content}, ... ]}
+            # 并行搜索每个 query 的 SERPER (顺序发起 search 请求，但每个 query 内并行抓取页面)
+            for q in queries_list:
+                st.write(f"🔍 搜索：{q}")
+                search_res = await serper_search(q, num=5)
+                organic = search_res.get("organic", []) or []
+                tasks = []
+                urls = []
+                for item in organic:
+                    link = item.get("link")
+                    if link:
+                        urls.append(link)
+                        tasks.append(fetch_full_content(link))
+                contents = []
+                if tasks:
+                    # 并行抓取该 query 的所有网页
+                    contents = await asyncio.gather(*tasks)
+                results_for_q = []
+                for item, content in zip(organic, contents):
+                    results_for_q.append(
+                        {
+                            "title": item.get("title"),
+                            "link": item.get("link"),
+                            "snippet": item.get("snippet"),
+                            "content": content or "",
+                        }
+                    )
+                per_query_results[q] = results_for_q
+            return per_query_results
 
-#     report_prompt = f"""
-#     你是一位专业的市场分析顾问，请根据以下资料，为主题“{query}”生成一份结构化市场调研报告，格式如下：
-#     ---
-#     ## 行业概述
-#     ...
-#     ## 主要趋势
-#     ...
-#     ## 竞争格局
-#     ...
-#     ## 用户洞察
-#     ...
-#     ## 总结与建议
-#     ...
-#     ---
-#     以下是参考资料：
-#     {merged_info}
-#     """
+        with st.spinner("正在并行检索并抓取网页全文，请稍候..."):
+            try:
+                per_query_results = asyncio.run(run_all_search_and_fetch(queries))
+            except Exception as e:
+                st.error(f"检索失败：{e}")
+                per_query_results = {}
 
-#     # 定义生成报告的消息列表
-#     report_messages = [
-#         SystemMessage(
-#             content="你是一位专业的市场分析顾问，专注于生成结构严谨、内容深入的市场调研报告。"
-#         ),
-#         HumanMessage(content=report_prompt),
-#     ]
+        # 合并并去重（把每条网页正文加入全局语料）
+        all_texts = []
+        for q, items in per_query_results.items():
+            st.write(f"结果：{q} 共 {len(items)} 条")
+            for it in items:
+                if it.get("content"):
+                    all_texts.append(it["content"])
+                else:
+                    # fallback 用 snippet
+                    snippet = it.get("snippet") or ""
+                    if snippet:
+                        all_texts.append(snippet)
+        merged_text = merge_and_dedupe_texts(all_texts)
+        # 将背景资料（PDF/粘贴）也包含进来
+        if st.session_state.collected_texts:
+            merged_text = st.session_state.collected_texts + "\n\n" + merged_text
 
-#     # 调整温度以获得更具创造性的报告
-#     llm.temperature = 0.5
-#     report_resp = llm.invoke(report_messages)
-#     report_text = report_resp.content.strip()
+        st.session_state.collected_texts = merged_text
+        st.success(f"抓取并合并完成，合并后语料长度：{len(merged_text)} 字符")
+        # 展示预览
+        st.subheader("语料预览（前 3000 字）")
+        st.text(merged_text[:3000])
 
-#     st.success("✅ 报告生成完成")
-#     st.subheader("📄 市场调研报告")
-#     st.markdown(report_text)
+# ---------------------------
+# UI：生成报告、显示竞品矩阵、多轮追问
+# ---------------------------
 
-#     # Step 4️⃣ 导出功能
-#     st.download_button(
-#         label="💾 下载报告（Markdown）",
-#         data=report_text,
-#         file_name="market_report.md",
-#         mime="text/markdown",
-#     )
 
-#     # 导出 PDF
-#     pdf_path = save_as_pdf(report_text)
-#     with open(pdf_path, "rb") as f:
-#         st.download_button(
-#             label="📄 下载报告（PDF）",
-#             data=f,
-#             file_name="market_report.pdf",
-#             mime="application/pdf",
-#         )
+st.header("4) 生成报告 & 多轮补充")
+
+colA, colB = st.columns([2, 1])
+with colA:
+    if st.button("生成初始市场分析报告"):
+        if not st.session_state.collected_texts:
+            st.warning("请先检索并合并语料（第3步）或上传/粘贴背景资料")
+        else:
+            with st.spinner("正在生成报告...（可能需要 20-60 秒）"):
+                report_text = generate_market_report_from_corpus(
+                    user_query, st.session_state.collected_texts
+                )
+                st.session_state.report = report_text
+                st.success("报告已生成")
+                st.subheader("📘 报告预览")
+                st.markdown(report_text)
+
+with colB:
+    if st.button("生成竞品对比矩阵（Markdown）"):
+        if not st.session_state.collected_texts:
+            st.warning("请先准备语料")
+        else:
+            with st.spinner("生成竞品矩阵..."):
+                matrix_md = generate_competitor_matrix(st.session_state.collected_texts)
+                st.session_state.matrix_md = matrix_md
+                st.success("竞品矩阵已生成")
+                st.markdown(matrix_md)
+
+# 多轮追问：模型建议问题并允许用户回答以更新报告
+if st.session_state.report:
+    st.subheader("🔄 多轮补充与追问")
+    suggested_questions = propose_followup_questions(st.session_state.report)
+    if suggested_questions:
+        st.info("模型建议补充的问题（可从中选择或自行输入）：")
+        for q in suggested_questions:
+            st.write(f"- {q}")
+    add_q = st.text_input("或者输入你希望补充的问题：", value="")
+    user_answer = st.text_area(
+        "在下方输入你的补充资料或回答（将用于更新报告）：", height=150
+    )
+    if st.button("将补充内容合并并更新报告"):
+        if not user_answer.strip():
+            st.warning("请先输入补充内容或回答")
+        else:
+            # 将用户补充加入语料
+            st.session_state.collected_texts += (
+                f"\n\n[USER_SUPPLEMENT]\nQuestion: {add_q}\nAnswer: {user_answer}"
+            )
+            with st.spinner("正在基于补充内容更新报告..."):
+                updated = generate_market_report_from_corpus(
+                    user_query, st.session_state.collected_texts
+                )
+                st.session_state.report = updated
+                st.success("报告已更新")
+                st.markdown(updated)
+
+# 最后显示历史（简单记录）
+st.sidebar.header("操作记录")
+st.sidebar.write(f"已生成 report 长度：{len(st.session_state.report)} 字符")
+if "matrix_md" in st.session_state:
+    st.sidebar.write("已生成竞品矩阵")
